@@ -3,13 +3,17 @@
 Synchronizační můstek mezi ERP systémem (soubor `erp_data.json`) a fiktivním
 e-shop API (`https://api.fake-eshop.cz/v1`). Django + Celery + Redis + Postgres.
 
+Čte produkty z ERP, validuje je a přepočítá DPH, posílá jen změněné produkty
+(delta sync přes hash payloadu). Rate-limited 5 req/s s retry na 429 / 5xx,
+invalidní data jdou do karantény místo tichých oprav.
+
 ## Spuštění
 
 ```bash
 docker compose up --build
 ```
 
-Při startu `web` služby se automaticky aplikují migrace. `beat` shoduluje
+Při startu `web` služby se automaticky aplikují migrace. `beat` plánuje
 periodickou synchronizaci (default každých 5 min, viz `ERP_SYNC_INTERVAL_SECONDS`).
 
 Ruční spuštění syncu (in-process, bez Celery — vhodné pro debug):
@@ -18,10 +22,6 @@ Ruční spuštění syncu (in-process, bez Celery — vhodné pro debug):
 docker compose exec web python manage.py run_sync
 ```
 
-Poznámka: výchozí `ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1` je záměrně
-fiktivní endpoint ze zadání. Bez přepsání této proměnné na reálný nebo lokálně
-mockovaný endpoint bude skutečný sync request selhávat.
-
 Vyvolání Celery tasku z Django shellu:
 
 ```bash
@@ -29,6 +29,11 @@ docker compose exec web python manage.py shell
 >>> from integrator.tasks import sync_erp_to_eshop
 >>> sync_erp_to_eshop.delay()
 ```
+
+> **Poznámka k fake API:** výchozí `ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1`
+> je záměrně fiktivní endpoint ze zadání — bez přepsání na reálný nebo lokálně
+> mockovaný endpoint bude skutečný sync request selhávat. Chování API je v
+> testech ověřeno přes HTTP-level mocky (`responses`).
 
 ## Testy
 
@@ -43,10 +48,6 @@ možné je pustit i lokálně bez Postgresu:
 pip install -r requirements.txt
 pytest
 ```
-
-Komunikace s e-shop API se v testech ověřuje přes HTTP-level mocky (`responses`)
-v `integrator/tests/test_eshop_client.py`; demo endpoint ze zadání není určený
-pro reálný end-to-end sync.
 
 ## Architektura
 
@@ -132,9 +133,25 @@ Viz `.env.example`. Klíčové proměnné:
 - `ERP_SYNC_INTERVAL_SECONDS` (default 300)
 - `VAT_RATE` (default 0.21)
 
+## Vědomá zjednodušení (out of scope pro tohle zadání)
+
+Vědomě zúžené, ne přehlédnuté. V reálném nasazení by se řešilo:
+
+- **Sklady se sčítají bez whitelistu.** Externí nebo servisní sklad by neměl
+  jít do prodejného stocku — řešilo by se přes konfiguraci povolených poboček.
+- **Lifecycle „SKU zmizelo z ERP" se neřeší.** Sync aktuálně jen vytváří a
+  updatuje. Produkčně by se hodila archivace / unpublish / `stock=0` pro
+  produkty, které z feedu vypadly.
+- **Duplicitní SKU = „last wins" tiše.** Pohodlné, ale produktově je to
+  datový incident — chtělo by to alert, ne spoléhat na pořadí záznamů.
+- **`color = "N/A"` jako sentinel v payloadu.** V reálu by se buď pole
+  neposílalo, nebo poslalo `null` — záleží na kontraktu cílového API.
+- **Jedna globální VAT sazba.** Pro vícekategoriovou nabídku by se hodila
+  daňová třída na úrovni produktu (ERP feed ji ale dnes nenese).
+
 ## Poznámky k produkčnímu nasazení
 
-Tohle je demo. Co by reálně bylo potřeba dořešit:
+Infra/provozní část, která by se řešila při nasazení mimo demo:
 
 - **Distribuovaný lock** přes Redis, pokud má běžet více workerů paralelně.
 - **Redis-backed rate limiter** ze stejného důvodu.
