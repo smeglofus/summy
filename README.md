@@ -144,8 +144,6 @@ Vědomě zúžené, ne přehlédnuté. V reálném nasazení by se řešilo:
   produkty, které z feedu vypadly.
 - **Duplicitní SKU = „last wins" tiše.** Pohodlné, ale produktově je to
   datový incident — chtělo by to alert, ne spoléhat na pořadí záznamů.
-- **`color = "N/A"` jako sentinel v payloadu.** V reálu by se buď pole
-  neposílalo, nebo poslalo `null` — záleží na kontraktu cílového API.
 - **Jedna globální VAT sazba.** Pro vícekategoriovou nabídku by se hodila
   daňová třída na úrovni produktu (ERP feed ji ale dnes nenese).
 
