@@ -18,6 +18,10 @@ Ruční spuštění syncu (in-process, bez Celery — vhodné pro debug):
 docker compose exec web python manage.py run_sync
 ```
 
+Poznámka: výchozí `ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1` je záměrně
+fiktivní endpoint ze zadání. Bez přepsání této proměnné na reálný nebo lokálně
+mockovaný endpoint bude skutečný sync request selhávat.
+
 Vyvolání Celery tasku z Django shellu:
 
 ```bash
@@ -39,6 +43,10 @@ možné je pustit i lokálně bez Postgresu:
 pip install -r requirements.txt
 pytest
 ```
+
+Komunikace s e-shop API se v testech ověřuje přes HTTP-level mocky (`responses`)
+v `integrator/tests/test_eshop_client.py`; demo endpoint ze zadání není určený
+pro reálný end-to-end sync.
 
 ## Architektura
 
