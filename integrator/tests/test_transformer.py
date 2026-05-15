@@ -97,6 +97,7 @@ def test_all_stocks_unknown_is_quarantined():
         {"praha": True},
         {"praha": 1, "brno": 2.5},
         {"praha": "5"},
+        {"praha": None},
         # Whole-valued floats (3.0) are also quarantined — JSON has no integer
         # type distinction, but the ERP contract requires integer quantities;
         # silently coercing 3.0 -> 3 would hide a producer-side type bug.

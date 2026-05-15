@@ -82,8 +82,9 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --- Cache ----------------------------------------------------------------
-# Redis-backed cache is used for the distributed sync lock (see SyncService.run).
-# Tests fall back to LocMemCache via core.test_settings.
+# Cache remains available for general use and as a best-effort lock fallback in
+# non-Postgres environments. The production singleton sync lock uses Postgres
+# advisory locking; see integrator.sync_lock.
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
@@ -96,9 +97,6 @@ CELERY_BROKER_URL = env.str("CELERY_BROKER_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = env.str("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_ACKS_LATE = True
-# Auto-retry transient failures with exponential backoff. acks_late handles
-# worker crashes (broker redelivers); this handles exceptions inside the task.
-CELERY_TASK_DEFAULT_RETRY_DELAY = 30
 ERP_SYNC_INTERVAL_SECONDS = env.float("ERP_SYNC_INTERVAL_SECONDS", 300.0)
 CELERY_BEAT_SCHEDULE = {
     "erp-to-eshop-sync": {

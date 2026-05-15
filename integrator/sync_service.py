@@ -11,18 +11,17 @@ import logging
 from pathlib import Path
 
 from django.conf import settings
-from django.core.cache import cache
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .eshop_client import EshopClient, EshopError
+from .eshop_client import EshopClient, EshopError, RemoteProductMissingError
 from .loader import load_erp_data
 from .models import ProductSyncState, QuarantinedProduct
 from .schemas import NormalizedProduct
+from .sync_lock import SyncRunLock
 from .transformer import transform
 
 logger = logging.getLogger(__name__)
-
-SYNC_LOCK_KEY = "erp_sync:lock"
 
 
 def stable_hash(payload: dict) -> str:
@@ -31,22 +30,32 @@ def stable_hash(payload: dict) -> str:
 
 
 class SyncService:
-    def __init__(self, client: EshopClient | None = None, data_path: Path | None = None):
+    def __init__(
+        self,
+        client: EshopClient | None = None,
+        data_path: Path | None = None,
+        run_lock: SyncRunLock | None = None,
+    ):
         self.client = client or EshopClient()
         self.data_path = data_path or settings.ERP_DATA_PATH
+        self.run_lock = run_lock or SyncRunLock()
 
     def run(self) -> dict:
-        # Distributed lock: if a previous sync still runs (or two beat ticks overlap),
-        # bail out instead of racing on the same payload_hash.
-        lock_timeout = int(settings.ERP_SYNC_INTERVAL_SECONDS) or 300
-        if not cache.add(SYNC_LOCK_KEY, "1", timeout=lock_timeout):
+        if not self.run_lock.acquire():
             logger.warning("Sync already in progress, skipping this tick")
-            return {"created": 0, "updated": 0, "skipped": 0, "failed": 0,
-                    "quarantined": 0, "resolved": 0, "locked": True}
+            return {
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+                "quarantined": 0,
+                "resolved": 0,
+                "locked": True,
+            }
         try:
             return self._run_locked()
         finally:
-            cache.delete(SYNC_LOCK_KEY)
+            self.run_lock.release()
 
     def _run_locked(self) -> dict:
         raw_records = load_erp_data(self.data_path)
@@ -78,50 +87,80 @@ class SyncService:
 
     @staticmethod
     def _record_quarantine(sku: str, raw_payload: dict, reason: str) -> None:
-        existing = QuarantinedProduct.objects.filter(
-            sku=sku,
-            resolved_at__isnull=True,
-        ).first()
-        if existing:
-            existing.raw_payload = raw_payload
-            existing.reason = reason
-            existing.save(update_fields=["raw_payload", "reason", "last_seen_at"])
-            return
+        with transaction.atomic():
+            existing = QuarantinedProduct.objects.select_for_update().filter(
+                sku=sku,
+                resolved_at__isnull=True,
+            ).first()
+            if existing:
+                existing.raw_payload = raw_payload
+                existing.reason = reason
+                existing.save(update_fields=["raw_payload", "reason", "last_seen_at"])
+                return
 
-        QuarantinedProduct.objects.create(
-            sku=sku,
-            raw_payload=raw_payload,
-            reason=reason,
-        )
+            try:
+                QuarantinedProduct.objects.create(
+                    sku=sku,
+                    raw_payload=raw_payload,
+                    reason=reason,
+                )
+            except IntegrityError:
+                existing = QuarantinedProduct.objects.select_for_update().get(
+                    sku=sku,
+                    resolved_at__isnull=True,
+                )
+                existing.raw_payload = raw_payload
+                existing.reason = reason
+                existing.save(update_fields=["raw_payload", "reason", "last_seen_at"])
 
     def _sync_one(self, product: NormalizedProduct) -> str:
         payload = product.to_payload()
         new_hash = stable_hash(payload)
-        state = ProductSyncState.objects.filter(sku=product.sku).first()
+        state, _ = ProductSyncState.objects.get_or_create(sku=product.sku)
 
-        if state and state.payload_hash == new_hash:
+        if state.remote_exists and state.payload_hash == new_hash and not state.create_in_progress:
             return "skipped"
 
-        if state:
+        if state.remote_exists:
             response = self.client.update_product(product.sku, payload)
-            state.payload_hash = new_hash
-            state.last_remote_status = response.status_code
-            # last_synced_at is auto_now=True — listing it in update_fields makes
-            # the model layer refresh the timestamp on save.
-            state.save(update_fields=["payload_hash", "last_remote_status", "last_synced_at"])
+            self._mark_synced(state, new_hash, response.status_code)
             return "updated"
 
-        # Idempotency-Key = payload hash: a redelivered POST after a worker crash
-        # between the HTTP call and the state write replays identically, so the
-        # server can dedupe rather than creating a second record.
-        response = self.client.create_product(payload, idempotency_key=new_hash)
-        # update_or_create (not create) for the same reason — if a previous attempt
-        # POSTed successfully but failed to write state, the row may already exist.
-        ProductSyncState.objects.update_or_create(
-            sku=product.sku,
-            defaults={
-                "payload_hash": new_hash,
-                "last_remote_status": response.status_code,
-            },
-        )
+        return self._create_or_recover(state, product.sku, payload, new_hash)
+
+    def _create_or_recover(self, state: ProductSyncState, sku: str, payload: dict, payload_hash: str) -> str:
+        if state.create_in_progress:
+            try:
+                response = self.client.update_product(sku, payload)
+            except RemoteProductMissingError:
+                logger.warning(
+                    "Recovery PATCH found no remote product for %s, retrying as POST create",
+                    sku,
+                )
+            else:
+                self._mark_synced(state, payload_hash, response.status_code)
+                return "updated"
+        else:
+            state.create_in_progress = True
+            state.save(update_fields=["create_in_progress"])
+
+        response = self.client.create_product(payload)
+        self._mark_synced(state, payload_hash, response.status_code)
         return "created"
+
+    @staticmethod
+    def _mark_synced(state: ProductSyncState, payload_hash: str, status_code: int) -> None:
+        state.payload_hash = payload_hash
+        state.remote_exists = True
+        state.create_in_progress = False
+        state.last_remote_status = status_code
+        state.last_synced_at = timezone.now()
+        state.save(
+            update_fields=[
+                "payload_hash",
+                "remote_exists",
+                "create_in_progress",
+                "last_remote_status",
+                "last_synced_at",
+            ]
+        )

@@ -25,6 +25,10 @@ class EshopError(Exception):
     """Permanent API failure (max retries exceeded or non-retryable status)."""
 
 
+class RemoteProductMissingError(EshopError):
+    """PATCH target does not exist on the remote side."""
+
+
 class EshopClient:
     def __init__(
         self,
@@ -49,8 +53,8 @@ class EshopClient:
         })
 
     def create_product(self, payload: dict, idempotency_key: str | None = None) -> requests.Response:
-        # Idempotency-Key lets the server dedupe replays after a worker crash
-        # between a successful POST and the local state write (acks_late redelivery).
+        # Optional passthrough for APIs that explicitly support idempotency.
+        # SyncService does not rely on this header for correctness.
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         return self._request("POST", "/products/", json=payload, headers=headers)
 
@@ -102,6 +106,9 @@ class EshopClient:
 
             if response.ok:
                 return response
+
+            if method == "PATCH" and response.status_code == 404:
+                raise RemoteProductMissingError(f"{method} {url} failed with 404: remote SKU missing")
 
             raise EshopError(
                 f"{method} {url} failed with {response.status_code}: {response.text[:200]}"

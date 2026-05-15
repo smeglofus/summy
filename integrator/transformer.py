@@ -94,8 +94,6 @@ def _normalize_stocks(raw_stocks) -> int:
             raise ValidationError("invalid_stock_type")
         if isinstance(qty, str) and qty.strip().upper() == "N/A":
             continue
-        if qty is None:
-            continue
         raise ValidationError("invalid_stock_type")
     if not has_integer:
         raise ValidationError("no_known_stock")

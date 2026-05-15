@@ -2,7 +2,7 @@ import pytest
 import requests
 import responses
 
-from integrator.eshop_client import EshopClient, EshopError
+from integrator.eshop_client import EshopClient, EshopError, RemoteProductMissingError
 from integrator.rate_limiter import RateLimiter
 
 
@@ -120,6 +120,16 @@ def test_4xx_other_than_429_is_not_retried():
     with pytest.raises(EshopError, match="400"):
         client.create_product({"sku": "SKU-6"})
     assert len(responses.calls) == 1  # no retry
+
+
+@responses.activate
+def test_patch_404_raises_remote_product_missing_error():
+    responses.patch("https://api.fake-eshop.cz/v1/products/SKU-404/", status=404, json={"err": "missing"})
+
+    client, _ = _client()
+    with pytest.raises(RemoteProductMissingError, match="remote SKU missing"):
+        client.update_product("SKU-404", {"price_with_vat": "10.00"})
+    assert len(responses.calls) == 1
 
 
 @responses.activate

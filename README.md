@@ -1,48 +1,36 @@
-# Symmy Tasker — ERP → e-shop integrator
+# Symmy Task - ERP -> e-shop integrator
 
-Synchronizační můstek mezi ERP systémem (soubor `erp_data.json`) a fiktivním
-e-shop API (`https://api.fake-eshop.cz/v1`). Django + Celery + Redis + Postgres.
+Synchronizacni mustek mezi ERP feedem v `erp_data.json` a fiktivnim e-shop API
+(`https://api.fake-eshop.cz/v1`). Stack: Django, Celery, Redis, Postgres.
 
-Čte produkty z ERP, validuje je a přepočítá DPH, posílá jen změněné produkty
-(delta sync přes hash payloadu). Rate-limited 5 req/s s retry na 429 / 5xx,
-invalidní data jdou do karantény místo tichých oprav.
+Fokus je na korektni sync semantice:
 
-## Spuštění
+- transformace ERP dat do cisteho payloadu pro e-shop
+- delta sync jen pro zmenene produkty
+- retry na 429 / 5xx / network chyby
+- quarantine misto tichych oprav vadnych dat
+- singleton beh syncu bez prekryvu workeru
+- recovery po padu mezi uspesnym create requestem a lokalnim DB zapisem
+
+## Spusteni
 
 ```bash
 docker compose up --build
 ```
 
-Při startu `web` služby se automaticky aplikují migrace. `beat` plánuje
-periodickou synchronizaci (default každých 5 min, viz `ERP_SYNC_INTERVAL_SECONDS`).
-
-Ruční spuštění syncu (in-process, bez Celery — vhodné pro debug):
+Rucni sync bez Celery:
 
 ```bash
 docker compose exec web python manage.py run_sync
 ```
 
-Vyvolání Celery tasku z Django shellu:
-
-```bash
-docker compose exec web python manage.py shell
->>> from integrator.tasks import sync_erp_to_eshop
->>> sync_erp_to_eshop.delay()
-```
-
-> **Poznámka k fake API:** výchozí `ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1`
-> je záměrně fiktivní endpoint ze zadání — bez přepsání na reálný nebo lokálně
-> mockovaný endpoint bude skutečný sync request selhávat. Chování API je v
-> testech ověřeno přes HTTP-level mocky (`responses`).
-
-## Testy
+Testy:
 
 ```bash
 docker compose exec web pytest
 ```
 
-Testy běží proti SQLite in-memory (viz `core/test_settings.py`), takže je
-možné je pustit i lokálně bez Postgresu:
+Lokalne bez Dockeru:
 
 ```bash
 pip install -r requirements.txt
@@ -51,124 +39,141 @@ pytest
 
 ## Architektura
 
-```
-ERP (erp_data.json)
-        |
-        v
-   loader  -> transformer (validate + dedupe + VAT + sum stocks)
-        |              \
-        |               +--> QuarantinedProduct  (invalid records)
-        v
-   sync_service -> hash compare -> ProductSyncState (delta)
-        |
-        v
-   eshop_client (rate limit 5/s, retry on 429 / 5xx)
-        |
-        v
-   POST /products/   (new)     PATCH /products/{sku}/   (changed)
+```text
+erp_data.json
+    |
+    v
+loader -> transformer -> valid payloads
+   |            |
+   |            +-> QuarantinedProduct
+   v
+SyncService -> ProductSyncState -> EshopClient
+                                   |
+                                   +-> POST /products/
+                                   +-> PATCH /products/{sku}/
 ```
 
-### Vrstvy (`integrator/`)
+### Moduly
 
-| Soubor | Odpovědnost |
+| Soubor | Odpovednost |
 |---|---|
-| `loader.py` | Čte `erp_data.json` z disku. |
-| `schemas.py` | `NormalizedProduct`, `QuarantineRecord`, `ValidationError`. |
-| `transformer.py` | Pure funkce: validace + transformace + dedup. |
-| `models.py` | `ProductSyncState` (delta sync), `QuarantinedProduct` (rejecty). |
-| `rate_limiter.py` | Sliding-window limiter (in-process, single worker). |
-| `eshop_client.py` | HTTP klient, rate limit, retry s respektem k `Retry-After`. |
-| `sync_service.py` | Orchestrátor: load → transform → diff přes hash → push. |
-| `tasks.py` | Tenký Celery task — pouze deleguje na `SyncService`. |
-| `management/commands/run_sync.py` | Synchronní spuštění syncu. |
+| `integrator/loader.py` | Nacteni JSON feedu z disku. |
+| `integrator/transformer.py` | Pure transformace a validace ERP zaznamu. |
+| `integrator/models.py` | `ProductSyncState` a `QuarantinedProduct`. |
+| `integrator/sync_lock.py` | Singleton lock pro cely sync. |
+| `integrator/eshop_client.py` | HTTP klient, retry, rate limiting. |
+| `integrator/sync_service.py` | Orchestrator load -> transform -> diff -> push. |
+| `integrator/tasks.py` | Tenky Celery wrapper bez business logiky. |
 
-### Klíčová rozhodnutí
+## Klicova rozhodnuti
 
-**Delta sync přes SHA-256 hash payloadu.** ERP data nemají `updated_at`, takže
-nejjednodušší robustní řešení je porovnání kanonického JSON hashe se stavem v DB:
+### Delta sync pres hash payloadu
 
-- není v DB → `POST /products/`
-- v DB, hash se shoduje → skip
-- v DB, hash se liší → `PATCH /products/{sku}/`
+ERP feed nema `updated_at`, proto se porovnava SHA-256 hash nad
+`NormalizedProduct.to_payload()`.
 
-Hash se ukládá **až po úspěšné odpovědi** — jinak by se selhání už nezopakovala.
-Hash je počítaný nad `NormalizedProduct.to_payload()`, tedy jen nad poli, která
-opravdu posíláme do e-shopu (sku, title, price\_with\_vat, total\_stock, color).
-ERP pole mimo tuto sadu (např. `attributes.material`) delta záměrně nezachytí.
+- neni state -> novy produkt
+- stejny hash -> skip
+- jiny hash -> PATCH
 
-**Idempotency-Key na `POST /products/`.** Hodnota = payload hash. Pokud worker
-spadne mezi úspěšným POSTem a zápisem `ProductSyncState` a Celery (přes
-`acks_late=True`) task redoručí, identický replay nevytvoří druhý záznam — server
-ho deduplikuje. PATCH idempotentní z principu (posíláme celý payload), takže
-hlavička tam není potřeba.
+`payload_hash` se uklada az po uspesne 2xx odpovedi.
 
-**Distribuovaný lock přes Redis cache.** Pokud sync trvá déle než
-`ERP_SYNC_INTERVAL_SECONDS` (default 300), další tick beatu se nepřekryje —
-`SyncService.run()` vrátí `{"locked": True}` a skončí. Implementováno přes
-Django `cache.add(...)` s atomickým chováním na Redisu.
+### Singleton sync bez timeoutoveho locku
 
-**Rate limit token-window v paměti procesu.** Worker běží s `--concurrency=1`
-(viz `docker-compose.yml`), takže 5 req/s znamená opravdu 5 req/s, ne N\*5.
-Při scale-outu na víc workerů přejít na Redis-backed token bucket — rozhraní
-`RateLimiter` zůstává stejné.
+Produkce bezi na Postgresu, proto je cely sync chranen PostgreSQL advisory
+lockem. Ten ma tri vyhody:
 
-**Retry respektuje `Retry-After`.** Pokud server pošle hodnotu jako header
-(integer/sekundy), použije se. Jinak fallback na exponenciální backoff.
+- nema TTL, takze neexpiruje uprostred dlouheho behu
+- release je ownership-safe na stejnem DB spojeni
+- pri padu procesu se lock uvolni automaticky zavrenim spojeni
 
-**Quarantine, ne self-healing.** Záznamy s `null` / zápornou cenou, s neplatným
-stock payloadem nebo bez známých skladů se neopravují potichu, ale jdou do
-`QuarantinedProduct` k revizi. Opakovaný výskyt stejného SKU pouze obnoví
-existující otevřený záznam (`last_seen_at`, `raw_payload`, `reason`) místo
-zakládání duplicit. Při dalším syncu, pokud ERP pošle SKU opravené, se
-quarantine sám uzavře (`resolved_at`). Důvod: nikdy si nepřebírat
-zodpovědnost za chyby zdroje — e-shop nesmí dostat produkt za -150 Kč.
+V testech na SQLite se pouziva jen best-effort fallback pres Django cache,
+protoze SQLite advisory lock nema.
 
-**Decimal pro peníze.** `12400.50 * 1.21` se v `float` zaokrouhlí jinak než v
-`Decimal`. Cena se ukládá jako string ve formátu s 2 desetinnými místy.
+### Recovery po padu mezi POST a DB write
 
-### Pravidla validace
+Sync na nepopsanem `Idempotency-Key` nestavi korektnost celeho flow.
 
-| Pole | Pravidlo | Při porušení |
+Pred prvnim `POST /products/` se do `ProductSyncState` ulozi lokalni marker
+`create_in_progress=True`. Pokud worker spadne po uspesnem POSTu, ale pred
+finalnim lokalnim zapisem hashe, dalsi beh:
+
+1. uvidi `create_in_progress=True`
+2. zkusi `PATCH /products/{sku}/`
+3. pokud PATCH projde, jen dokonci lokalni stav bez druheho POSTu
+4. pokud PATCH vrati 404, fallbackne na `POST /products/`
+
+Tahle semantika je podlozena endpointem adresovanym podle SKU a nestoji na
+nezdokumentovane podpore idempotency headeru.
+
+### Quarantine je skutecne stav v DB
+
+Vadna data se neopravuji potichu. Jdou do `QuarantinedProduct`.
+
+- v aplikaci se existujici otevrena quarantine pro stejne SKU jen obnovi
+- v DB je partial unique constraint: maximalne jedna otevrena quarantine na SKU
+- pokud se SKU v dalsim feedu opravi, otevrena quarantine se uzavre pres
+  `resolved_at`
+
+### Retry a rate limit
+
+`EshopClient`:
+
+- drzi limit 5 req/s pres in-process limiter
+- retryuje 429 s respektem k `Retry-After`
+- retryuje transientni 5xx a network chyby s exponential backoff
+- vraci specialni `RemoteProductMissingError` pro `PATCH 404`, aby sync mohl
+  korektne udelat recovery create flow
+
+Limit je garantovany pro jeden worker proces. `docker-compose.yml` proto pouziva
+`celery ... --concurrency=1`.
+
+## Validace ERP dat
+
+| Pole | Pravidlo | Pri poruseni |
 |---|---|---|
 | `id` | non-empty string | quarantine `missing_sku` |
 | `title` | non-empty string | quarantine `missing_title` |
 | `price_vat_excl` | `Decimal > 0` | quarantine `missing_price` / `invalid_price_type` / `non_positive_price` |
-| `stocks` | dict s ≥ 1 integer hodnotou; sentinel `"N/A"` se ignoruje | quarantine `no_known_stock` / `invalid_stock_type` |
-| `attributes.color` | string nebo nic | fallback `"N/A"` |
+| `stocks` | dict s aspon jednou integer hodnotou; `"N/A"` je povoleny sentinel | quarantine `no_known_stock` / `invalid_stock_type` |
+| `attributes.color` | prazdne nebo chybejici -> `"N/A"` | fallback `"N/A"` |
 
-Duplicity SKU: poslední záznam vítězí.
+Dulezite:
+
+- `None` ve stocku je neplatna hodnota, ne "unknown"
+- `float` stock je neplatny, i kdyz ma hodnotu `3.0`
+- duplicitni SKU v jednom feedu: posledni zaznam vyhrava
 
 ## Konfigurace
 
-Viz `.env.example`. Klíčové proměnné:
+Hlavni promenne z `.env.example`:
 
+- `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
+- `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
+- `ERP_DATA_FILENAME`
 - `ESHOP_API_BASE_URL`, `ESHOP_API_KEY`
-- `ESHOP_RATE_LIMIT_PER_SEC` (default 5)
-- `ESHOP_MAX_RETRIES` (default 5)
-- `ERP_SYNC_INTERVAL_SECONDS` (default 300)
-- `VAT_RATE` (default 0.21)
+- `ESHOP_RATE_LIMIT_PER_SEC`
+- `ESHOP_MAX_RETRIES`
+- `ESHOP_REQUEST_TIMEOUT`
+- `ERP_SYNC_INTERVAL_SECONDS`
+- `VAT_RATE`
 
-## Vědomá zjednodušení (out of scope pro tohle zadání)
+## Testy
 
-Vědomě zúžené, ne přehlédnuté. V reálném nasazení by se řešilo:
+Test suite pokryva hlavne:
 
-- **Sklady se sčítají bez whitelistu.** Externí nebo servisní sklad by neměl
-  jít do prodejného stocku — řešilo by se přes konfiguraci povolených poboček.
-- **Lifecycle „SKU zmizelo z ERP" se neřeší.** Sync aktuálně jen vytváří a
-  updatuje. Produkčně by se hodila archivace / unpublish / `stock=0` pro
-  produkty, které z feedu vypadly.
-- **Duplicitní SKU = „last wins" tiše.** Pohodlné, ale produktově je to
-  datový incident — chtělo by to alert, ne spoléhat na pořadí záznamů.
-- **Jedna globální VAT sazba.** Pro vícekategoriovou nabídku by se hodila
-  daňová třída na úrovni produktu (ERP feed ji ale dnes nenese).
+- parametrizovane edge cases v `transformer.py`
+- retry a HTTP chovani `EshopClient` pres `responses`
+- delta sync create / update / skip
+- quarantine resolve flow
+- DB constraint na jednu otevrenou quarantine
+- recovery po padu mezi remote success a lokalni finalizaci state
 
-## Poznámky k produkčnímu nasazení
+## Vedoma omezeni
 
-Infra/provozní část, která by se řešila při nasazení mimo demo:
+Neco zustava zamerne mimo scope zadani:
 
-- **Redis-backed rate limiter** — aktuálně in-process s `--concurrency=1`. Při
-  scale-outu na víc workerů přejít na sdílený token bucket (interface
-  `RateLimiter` zůstává stejné).
-- **Alerting** nad `QuarantinedProduct` (Slack webhook nebo dashboard) místo
-  jen `last_seen_at`.
-- **Sentry / strukturované logy** místo plain stdlib loggeru.
+- rate limiter je in-process, ne sdileny mezi vice worker procesy
+- neresi se lifecycle "SKU zmizelo z ERP"
+- neni implementovane alertovani nad quarantine
+- fake API je porad jen mockovane v testech, ne realny endpoint
