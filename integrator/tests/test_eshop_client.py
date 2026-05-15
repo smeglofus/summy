@@ -2,7 +2,7 @@ import pytest
 import requests
 import responses
 
-from integrator.eshop_client import EshopClient, EshopError, RemoteProductMissingError
+from integrator.eshop_client import EshopClient, EshopError
 from integrator.rate_limiter import RateLimiter
 
 
@@ -123,11 +123,11 @@ def test_4xx_other_than_429_is_not_retried():
 
 
 @responses.activate
-def test_patch_404_raises_remote_product_missing_error():
+def test_patch_404_raises_eshop_error():
     responses.patch("https://api.fake-eshop.cz/v1/products/SKU-404/", status=404, json={"err": "missing"})
 
     client, _ = _client()
-    with pytest.raises(RemoteProductMissingError, match="remote SKU missing"):
+    with pytest.raises(EshopError, match="404"):
         client.update_product("SKU-404", {"price_with_vat": "10.00"})
     assert len(responses.calls) == 1
 
@@ -141,24 +141,6 @@ def test_max_retries_exceeded_raises():
     with pytest.raises(EshopError, match="exhausted retries"):
         client.create_product({"sku": "SKU-7"})
     assert len(responses.calls) == client.max_retries + 1
-
-
-@responses.activate
-def test_create_product_sends_idempotency_key_when_provided():
-    responses.post("https://api.fake-eshop.cz/v1/products/", json={"ok": True}, status=201)
-
-    client, _ = _client()
-    client.create_product({"sku": "SKU-8"}, idempotency_key="hash-abc")
-    assert responses.calls[0].request.headers["Idempotency-Key"] == "hash-abc"
-
-
-@responses.activate
-def test_create_product_omits_idempotency_key_header_when_not_provided():
-    responses.post("https://api.fake-eshop.cz/v1/products/", json={"ok": True}, status=201)
-
-    client, _ = _client()
-    client.create_product({"sku": "SKU-9"})
-    assert "Idempotency-Key" not in responses.calls[0].request.headers
 
 
 @responses.activate

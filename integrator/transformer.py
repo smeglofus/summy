@@ -1,47 +1,52 @@
-"""ERP record validation and normalization.
-
-Rules (see AGENTS.md for rationale):
-* Duplicates by SKU -> last record wins.
-* Missing/null/non-positive price -> quarantine (we do NOT silently fix money).
-* Stocks: sum integer warehouse values, allow "N/A" as an unknown sentinel.
-  Non-integer quantities -> quarantine. If no warehouse reports an integer
-  quantity -> quarantine.
-* Missing/non-dict attributes -> color defaults to "N/A".
-"""
+"""ERP record validation and normalization."""
+import logging
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable
 
 from django.conf import settings
 
-from .schemas import NormalizedProduct, QuarantineRecord, ValidationError
+from .schemas import NormalizedProduct
 
 DEFAULT_COLOR = "N/A"
 _CENT = Decimal("0.01")
 
+logger = logging.getLogger(__name__)
 
-def transform(records: Iterable[dict]) -> tuple[list[NormalizedProduct], list[QuarantineRecord]]:
-    """Validate and normalize ERP records. Returns (valid, quarantined)."""
+
+class ValidationError(Exception):
+    """Raised when a single ERP record fails validation."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def transform(records: Iterable[dict]) -> list[NormalizedProduct]:
+    """Validate and normalize ERP records, skipping invalid records."""
     deduped: "OrderedDict[str, dict]" = OrderedDict()
-    quarantined: list[QuarantineRecord] = []
 
     for record in records:
         if not isinstance(record, dict):
-            quarantined.append(QuarantineRecord(sku="?", raw={"value": record}, reason="not_an_object"))
+            _log_skip("?", "not_an_object")
             continue
         sku = record.get("id")
         if not isinstance(sku, str) or not sku.strip():
-            quarantined.append(QuarantineRecord(sku="?", raw=record, reason="missing_sku"))
+            _log_skip("?", "missing_sku")
             continue
-        deduped[sku] = record  # last wins
+        deduped[sku] = record
 
     valid: list[NormalizedProduct] = []
     for sku, record in deduped.items():
         try:
             valid.append(_normalize(sku, record))
         except ValidationError as exc:
-            quarantined.append(QuarantineRecord(sku=sku, raw=record, reason=exc.reason))
-    return valid, quarantined
+            _log_skip(sku, exc.reason)
+    return valid
+
+
+def _log_skip(sku: str, reason: str) -> None:
+    logger.warning("Skipping ERP record sku=%s reason=%s", sku, reason)
 
 
 def _normalize(sku: str, record: dict) -> NormalizedProduct:

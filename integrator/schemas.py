@@ -20,20 +20,3 @@ class NormalizedProduct:
             "total_stock": self.total_stock,
             "color": self.color,
         }
-
-
-@dataclass(frozen=True)
-class QuarantineRecord:
-    """ERP record rejected by validation."""
-
-    sku: str
-    raw: dict
-    reason: str
-
-
-class ValidationError(Exception):
-    """Raised when a single ERP record fails validation. `reason` is a short tag."""
-
-    def __init__(self, reason: str):
-        self.reason = reason
-        super().__init__(reason)
