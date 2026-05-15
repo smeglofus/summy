@@ -46,8 +46,11 @@ class EshopClient:
             "Accept": "application/json",
         })
 
-    def create_product(self, payload: dict) -> requests.Response:
-        return self._request("POST", "/products/", json=payload)
+    def create_product(self, payload: dict, idempotency_key: str | None = None) -> requests.Response:
+        # Idempotency-Key lets the server dedupe replays after a worker crash
+        # between a successful POST and the local state write (acks_late redelivery).
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return self._request("POST", "/products/", json=payload, headers=headers)
 
     def update_product(self, sku: str, payload: dict) -> requests.Response:
         return self._request("PATCH", f"/products/{sku}/", json=payload)

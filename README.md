@@ -92,10 +92,25 @@ nejjednodušší robustní řešení je porovnání kanonického JSON hashe se s
 - v DB, hash se liší → `PATCH /products/{sku}/`
 
 Hash se ukládá **až po úspěšné odpovědi** — jinak by se selhání už nezopakovala.
+Hash je počítaný nad `NormalizedProduct.to_payload()`, tedy jen nad poli, která
+opravdu posíláme do e-shopu (sku, title, price\_with\_vat, total\_stock, color).
+ERP pole mimo tuto sadu (např. `attributes.material`) delta záměrně nezachytí.
 
-**Rate limit token-window v paměti procesu.** Zadání mluví o jednom workeru,
-in-process limiter je tedy dostatečný a má nulové závislosti. Při scale-outu
-přejít na Redis-backend (rozhraní `RateLimiter` zůstává stejné).
+**Idempotency-Key na `POST /products/`.** Hodnota = payload hash. Pokud worker
+spadne mezi úspěšným POSTem a zápisem `ProductSyncState` a Celery (přes
+`acks_late=True`) task redoručí, identický replay nevytvoří druhý záznam — server
+ho deduplikuje. PATCH idempotentní z principu (posíláme celý payload), takže
+hlavička tam není potřeba.
+
+**Distribuovaný lock přes Redis cache.** Pokud sync trvá déle než
+`ERP_SYNC_INTERVAL_SECONDS` (default 300), další tick beatu se nepřekryje —
+`SyncService.run()` vrátí `{"locked": True}` a skončí. Implementováno přes
+Django `cache.add(...)` s atomickým chováním na Redisu.
+
+**Rate limit token-window v paměti procesu.** Worker běží s `--concurrency=1`
+(viz `docker-compose.yml`), takže 5 req/s znamená opravdu 5 req/s, ne N\*5.
+Při scale-outu na víc workerů přejít na Redis-backed token bucket — rozhraní
+`RateLimiter` zůstává stejné.
 
 **Retry respektuje `Retry-After`.** Pokud server pošle hodnotu jako header
 (integer/sekundy), použije se. Jinak fallback na exponenciální backoff.
@@ -151,8 +166,9 @@ Vědomě zúžené, ne přehlédnuté. V reálném nasazení by se řešilo:
 
 Infra/provozní část, která by se řešila při nasazení mimo demo:
 
-- **Distribuovaný lock** přes Redis, pokud má běžet více workerů paralelně.
-- **Redis-backed rate limiter** ze stejného důvodu.
+- **Redis-backed rate limiter** — aktuálně in-process s `--concurrency=1`. Při
+  scale-outu na víc workerů přejít na sdílený token bucket (interface
+  `RateLimiter` zůstává stejné).
 - **Alerting** nad `QuarantinedProduct` (Slack webhook nebo dashboard) místo
   jen `last_seen_at`.
 - **Sentry / strukturované logy** místo plain stdlib loggeru.

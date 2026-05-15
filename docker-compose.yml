@@ -43,11 +43,17 @@ services:
     command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000"
     ports:
       - "8000:8000"
+    restart: unless-stopped
 
   worker:
     <<: *app
-    command: celery -A core worker --loglevel=info
+    # --concurrency=1 keeps the in-process rate limiter accurate (5 req/s really
+    # means 5 req/s, not N*5). For real multi-worker scale-out switch to a
+    # Redis-backed token bucket; see AGENTS.md.
+    command: celery -A core worker --loglevel=info --concurrency=1
+    restart: unless-stopped
 
   beat:
     <<: *app
     command: celery -A core beat --loglevel=info
+    restart: unless-stopped

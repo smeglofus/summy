@@ -131,3 +131,21 @@ def test_max_retries_exceeded_raises():
     with pytest.raises(EshopError, match="exhausted retries"):
         client.create_product({"sku": "SKU-7"})
     assert len(responses.calls) == client.max_retries + 1
+
+
+@responses.activate
+def test_create_product_sends_idempotency_key_when_provided():
+    responses.post("https://api.fake-eshop.cz/v1/products/", json={"ok": True}, status=201)
+
+    client, _ = _client()
+    client.create_product({"sku": "SKU-8"}, idempotency_key="hash-abc")
+    assert responses.calls[0].request.headers["Idempotency-Key"] == "hash-abc"
+
+
+@responses.activate
+def test_create_product_omits_idempotency_key_header_when_not_provided():
+    responses.post("https://api.fake-eshop.cz/v1/products/", json={"ok": True}, status=201)
+
+    client, _ = _client()
+    client.create_product({"sku": "SKU-9"})
+    assert "Idempotency-Key" not in responses.calls[0].request.headers

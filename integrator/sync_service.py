@@ -1,11 +1,17 @@
-"""Orchestrates the full ERP -> e-shop sync flow."""
+"""Orchestrates the full ERP -> e-shop sync flow.
+
+Note on hash coverage: ``stable_hash`` is computed over ``NormalizedProduct.to_payload()``
+only — sku, title, price_with_vat, total_stock, color. ERP fields outside this set
+(e.g. ``attributes.material``) do NOT trigger a delta. Extend ``to_payload`` if a new
+field becomes externally visible.
+"""
 import hashlib
 import json
 import logging
 from pathlib import Path
 
 from django.conf import settings
-from django.db import transaction
+from django.core.cache import cache
 from django.utils import timezone
 
 from .eshop_client import EshopClient, EshopError
@@ -15,6 +21,8 @@ from .schemas import NormalizedProduct
 from .transformer import transform
 
 logger = logging.getLogger(__name__)
+
+SYNC_LOCK_KEY = "erp_sync:lock"
 
 
 def stable_hash(payload: dict) -> str:
@@ -28,6 +36,19 @@ class SyncService:
         self.data_path = data_path or settings.ERP_DATA_PATH
 
     def run(self) -> dict:
+        # Distributed lock: if a previous sync still runs (or two beat ticks overlap),
+        # bail out instead of racing on the same payload_hash.
+        lock_timeout = int(settings.ERP_SYNC_INTERVAL_SECONDS) or 300
+        if not cache.add(SYNC_LOCK_KEY, "1", timeout=lock_timeout):
+            logger.warning("Sync already in progress, skipping this tick")
+            return {"created": 0, "updated": 0, "skipped": 0, "failed": 0,
+                    "quarantined": 0, "resolved": 0, "locked": True}
+        try:
+            return self._run_locked()
+        finally:
+            cache.delete(SYNC_LOCK_KEY)
+
+    def _run_locked(self) -> dict:
         raw_records = load_erp_data(self.data_path)
         valid, quarantined = transform(raw_records)
         logger.info("Loaded %d records: %d valid, %d quarantined",
@@ -83,16 +104,24 @@ class SyncService:
 
         if state:
             response = self.client.update_product(product.sku, payload)
-            with transaction.atomic():
-                state.payload_hash = new_hash
-                state.last_remote_status = response.status_code
-                state.save(update_fields=["payload_hash", "last_remote_status", "last_synced_at"])
+            state.payload_hash = new_hash
+            state.last_remote_status = response.status_code
+            # last_synced_at is auto_now=True — listing it in update_fields makes
+            # the model layer refresh the timestamp on save.
+            state.save(update_fields=["payload_hash", "last_remote_status", "last_synced_at"])
             return "updated"
 
-        response = self.client.create_product(payload)
-        ProductSyncState.objects.create(
+        # Idempotency-Key = payload hash: a redelivered POST after a worker crash
+        # between the HTTP call and the state write replays identically, so the
+        # server can dedupe rather than creating a second record.
+        response = self.client.create_product(payload, idempotency_key=new_hash)
+        # update_or_create (not create) for the same reason — if a previous attempt
+        # POSTed successfully but failed to write state, the row may already exist.
+        ProductSyncState.objects.update_or_create(
             sku=product.sku,
-            payload_hash=new_hash,
-            last_remote_status=response.status_code,
+            defaults={
+                "payload_hash": new_hash,
+                "last_remote_status": response.status_code,
+            },
         )
         return "created"

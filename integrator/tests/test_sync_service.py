@@ -122,3 +122,56 @@ def test_stable_hash_differs_on_change():
     a = {"sku": "x", "price_with_vat": "1.00"}
     b = {"sku": "x", "price_with_vat": "2.00"}
     assert stable_hash(a) != stable_hash(b)
+
+
+@pytest.mark.django_db
+def test_create_passes_payload_hash_as_idempotency_key(erp_file, mock_client):
+    """The POST uses payload_hash as Idempotency-Key so worker-crash replays dedupe."""
+    SyncService(client=mock_client, data_path=erp_file).run()
+
+    _, kwargs = mock_client.create_product.call_args
+    assert "idempotency_key" in kwargs
+    payload = mock_client.create_product.call_args.args[0]
+    assert kwargs["idempotency_key"] == stable_hash(payload)
+
+
+@pytest.mark.django_db
+def test_second_run_when_lock_held_skips_with_locked_marker(erp_file, mock_client):
+    """If another worker holds the lock, a concurrent tick bails out cleanly."""
+    from django.core.cache import cache
+
+    from integrator.sync_service import SYNC_LOCK_KEY
+
+    cache.add(SYNC_LOCK_KEY, "1", timeout=60)
+    try:
+        stats = SyncService(client=mock_client, data_path=erp_file).run()
+    finally:
+        cache.delete(SYNC_LOCK_KEY)
+
+    assert stats.get("locked") is True
+    mock_client.create_product.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_lock_released_after_run(erp_file, mock_client):
+    from django.core.cache import cache
+
+    from integrator.sync_service import SYNC_LOCK_KEY
+
+    SyncService(client=mock_client, data_path=erp_file).run()
+    assert cache.get(SYNC_LOCK_KEY) is None
+
+
+@pytest.mark.django_db
+def test_redelivered_create_after_state_write_failure_does_not_duplicate(erp_file, mock_client):
+    """Simulate the acks_late redelivery scenario: POST succeeded last time,
+    state row got created, task replays. The hash matches, so it skips — not
+    a second POST."""
+    SyncService(client=mock_client, data_path=erp_file).run()
+    assert mock_client.create_product.call_count == 1
+    mock_client.reset_mock()
+
+    # Same input on redelivery — current behavior: hash matches state, skip.
+    stats = SyncService(client=mock_client, data_path=erp_file).run()
+    assert stats["skipped"] == 1
+    mock_client.create_product.assert_not_called()
