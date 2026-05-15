@@ -2,12 +2,14 @@ x-app: &app
   build: .
   volumes: ['.:/app']
   environment:
+    - DJANGO_SECRET_KEY=dev-only-change-me
     - CELERY_BROKER_URL=redis://redis:6379/0
     - CELERY_RESULT_BACKEND=redis://redis:6379/1
     - POSTGRES_HOST=db
     - POSTGRES_DB=symmy_task
     - POSTGRES_USER=postgres
     - POSTGRES_PASSWORD=postgres
+    - ESHOP_API_KEY=symma-secret-token
   depends_on:
     db:
       condition: service_healthy
@@ -46,9 +48,7 @@ services:
 
   worker:
     <<: *app
-    # --concurrency=1 keeps the in-process rate limiter accurate (5 req/s really
-    # means 5 req/s, not N*5). For real multi-worker scale-out switch to a
-    # Redis-backed token bucket; see AGENTS.md.
+    # --concurrency=1 keeps the in-process rate limiter accurate for one worker process.
     command: celery -A core worker --loglevel=info --concurrency=1
     restart: unless-stopped
 

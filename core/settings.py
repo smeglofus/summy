@@ -10,10 +10,7 @@ env.read_env()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = env.str(
-    "DJANGO_SECRET_KEY",
-    "django-insecure-mv0kt+(+=$5xn*pu1p#lk16zrl^pz5zdj8@(ah%glr=gz=nm9m",
-)
+SECRET_KEY = env.str("DJANGO_SECRET_KEY")
 DEBUG = env.bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", ["*"])
 
@@ -82,9 +79,6 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --- Cache ----------------------------------------------------------------
-# Cache remains available for general use and as a best-effort lock fallback in
-# non-Postgres environments. The production singleton sync lock uses Postgres
-# advisory locking; see integrator.sync_lock.
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
@@ -110,7 +104,7 @@ ERP_DATA_PATH = BASE_DIR / env.str("ERP_DATA_FILENAME", "erp_data.json")
 VAT_RATE = env.str("VAT_RATE", "0.21")
 
 ESHOP_API_BASE_URL = env.str("ESHOP_API_BASE_URL", "https://api.fake-eshop.cz/v1")
-ESHOP_API_KEY = env.str("ESHOP_API_KEY", "symma-secret-token")
+ESHOP_API_KEY = env.str("ESHOP_API_KEY")
 ESHOP_RATE_LIMIT_PER_SEC = env.int("ESHOP_RATE_LIMIT_PER_SEC", 5)
 ESHOP_MAX_RETRIES = env.int("ESHOP_MAX_RETRIES", 5)
 ESHOP_REQUEST_TIMEOUT = env.float("ESHOP_REQUEST_TIMEOUT", 10.0)

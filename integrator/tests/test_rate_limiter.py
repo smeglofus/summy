@@ -1,3 +1,5 @@
+import threading
+
 from integrator.rate_limiter import RateLimiter
 
 
@@ -41,3 +43,36 @@ def test_no_sleep_when_window_already_elapsed():
     clock.now = 1.5
     limiter.acquire()
     assert clock.sleeps == []
+
+
+def test_sleeping_acquire_does_not_hold_lock():
+    clock = FakeClock()
+    sleep_started = threading.Event()
+    release_sleep = threading.Event()
+
+    def controlled_sleep(seconds: float) -> None:
+        sleep_started.set()
+        release_sleep.wait(timeout=1.0)
+        clock.now += seconds
+
+    limiter = RateLimiter(
+        rate=1,
+        per=1.0,
+        sleep_fn=controlled_sleep,
+        monotonic_fn=clock.monotonic,
+    )
+    limiter.acquire()
+
+    thread = threading.Thread(target=limiter.acquire)
+    thread.start()
+    try:
+        assert sleep_started.wait(timeout=1.0)
+        acquired = limiter._lock.acquire(blocking=False)
+        if acquired:
+            limiter._lock.release()
+    finally:
+        release_sleep.set()
+        thread.join(timeout=1.0)
+
+    assert acquired is True
+    assert not thread.is_alive()

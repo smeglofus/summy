@@ -13,5 +13,8 @@ logger = logging.getLogger(__name__)
 def sync_erp_to_eshop() -> dict:
     """Run a full ERP -> e-shop sync cycle. Returns a stats summary."""
     stats = SyncService().run()
-    logger.info("sync_erp_to_eshop result: %s", stats)
+    if stats["failed"] > 0:
+        logger.error("sync_erp_to_eshop finished with failures: %s", stats)
+    else:
+        logger.info("sync_erp_to_eshop result: %s", stats)
     return stats

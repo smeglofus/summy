@@ -1,7 +1,7 @@
 """Sliding-window rate limiter for outbound API calls.
 
-In-process (single worker). For multi-worker scale-out switch to a Redis-backed
-token bucket — the interface here is unchanged. See AGENTS.md.
+In-process only. Docker runs the worker with concurrency=1 so the configured
+limit applies to one worker process.
 """
 import threading
 import time
@@ -27,15 +27,20 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def acquire(self) -> None:
-        """Block (sleep) until a request slot is free."""
-        with self._lock:
-            now = self._monotonic()
-            if len(self._timestamps) < self.rate:
-                self._timestamps.append(now)
-                return
-            oldest = self._timestamps[0]
-            wait = self.per - (now - oldest)
+        """Block until a request slot is free."""
+        while True:
+            with self._lock:
+                now = self._monotonic()
+
+                while self._timestamps and now - self._timestamps[0] >= self.per:
+                    self._timestamps.popleft()
+
+                if len(self._timestamps) < self.rate:
+                    self._timestamps.append(now)
+                    return
+
+                oldest = self._timestamps[0]
+                wait = self.per - (now - oldest)
+
             if wait > 0:
                 self._sleep(wait)
-                now += wait
-            self._timestamps.append(now)
