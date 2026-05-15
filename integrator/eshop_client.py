@@ -2,7 +2,7 @@
 
 Responsibilities:
 * Rate limit outbound requests (5 req/s by default).
-* Retry on 429 — respect Retry-After header when present.
+* Retry on 429 with respect for Retry-After when present.
 * Retry on transient network failures with exponential backoff.
 * Retry on transient 5xx with exponential backoff.
 * Raise EshopError on permanent failures.
@@ -12,6 +12,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Callable
+from urllib.parse import quote
 
 import requests
 from django.conf import settings
@@ -22,7 +23,25 @@ logger = logging.getLogger(__name__)
 
 
 class EshopError(Exception):
-    """Permanent API failure (max retries exceeded or non-retryable status)."""
+    """Permanent API failure, or exhausted retries for a retryable failure."""
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ):
+        self.status_code = status_code
+        self.retryable = retryable
+        super().__init__(message)
+
+
+class RemoteProductMissingError(EshopError):
+    """The e-shop has no product for a PATCHed SKU."""
+
+
+class RemoteProductConflictError(EshopError):
+    """The e-shop already has a product for a POSTed SKU."""
 
 
 class EshopClient:
@@ -38,7 +57,10 @@ class EshopClient:
     ):
         self.base_url = (base_url or settings.ESHOP_API_BASE_URL).rstrip("/")
         self.api_key = api_key or settings.ESHOP_API_KEY
-        self.rate_limiter = rate_limiter or RateLimiter(rate=settings.ESHOP_RATE_LIMIT_PER_SEC)
+        self.rate_limiter = rate_limiter or RateLimiter(
+            rate=settings.ESHOP_RATE_LIMIT_PER_SEC,
+            cache_key=settings.ESHOP_RATE_LIMIT_CACHE_KEY,
+        )
         self.max_retries = max_retries if max_retries is not None else settings.ESHOP_MAX_RETRIES
         self.timeout = timeout if timeout is not None else settings.ESHOP_REQUEST_TIMEOUT
         self._sleep = sleep_fn
@@ -52,7 +74,8 @@ class EshopClient:
         return self._request("POST", "/products/", json=payload)
 
     def update_product(self, sku: str, payload: dict) -> requests.Response:
-        return self._request("PATCH", f"/products/{sku}/", json=payload)
+        encoded_sku = quote(sku, safe="")
+        return self._request("PATCH", f"/products/{encoded_sku}/", json=payload)
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self.base_url}{path}"
@@ -100,17 +123,34 @@ class EshopClient:
             if response.ok:
                 return response
 
+            if method == "PATCH" and response.status_code == 404:
+                raise RemoteProductMissingError(
+                    f"{method} {url} failed with 404: {response.text[:200]}",
+                    status_code=response.status_code,
+                )
+
+            if method == "POST" and response.status_code == 409:
+                raise RemoteProductConflictError(
+                    f"{method} {url} failed with 409: {response.text[:200]}",
+                    status_code=response.status_code,
+                )
+
             raise EshopError(
-                f"{method} {url} failed with {response.status_code}: {response.text[:200]}"
+                f"{method} {url} failed with {response.status_code}: {response.text[:200]}",
+                status_code=response.status_code,
             )
 
         if last_response is not None:
+            retryable = last_response.status_code == 429 or 500 <= last_response.status_code < 600
             raise EshopError(
-                f"{method} {url} exhausted retries (last status: {last_response.status_code})"
+                f"{method} {url} exhausted retries (last status: {last_response.status_code})",
+                status_code=last_response.status_code,
+                retryable=retryable,
             )
         if last_error is not None:
             raise EshopError(
-                f"{method} {url} exhausted retries after network error: {last_error}"
+                f"{method} {url} exhausted retries after network error: {last_error}",
+                retryable=True,
             ) from last_error
         raise EshopError(f"{method} {url} exhausted retries (no response)")
 

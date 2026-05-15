@@ -2,7 +2,12 @@ import pytest
 import requests
 import responses
 
-from integrator.eshop_client import EshopClient, EshopError
+from integrator.eshop_client import (
+    EshopClient,
+    EshopError,
+    RemoteProductConflictError,
+    RemoteProductMissingError,
+)
 from integrator.rate_limiter import RateLimiter
 
 
@@ -36,6 +41,7 @@ def test_create_product_sends_post_with_auth_header():
     response = client.create_product({"sku": "SKU-1"})
     assert response.status_code == 201
     assert responses.calls[0].request.headers["X-Api-Key"] == "symma-secret-token"
+    assert "Idempotency-Key" not in responses.calls[0].request.headers
 
 
 @responses.activate
@@ -47,6 +53,20 @@ def test_update_product_sends_patch_with_sku_in_url():
     client, _ = _client()
     response = client.update_product("SKU-2", {"price_with_vat": "121.00"})
     assert response.status_code == 200
+
+
+@responses.activate
+def test_update_product_url_encodes_unsafe_sku_characters():
+    responses.patch(
+        "https://api.fake-eshop.cz/v1/products/SKU%2Fwith%20space%3Fx/",
+        json={"ok": True}, status=200,
+    )
+    client, _ = _client()
+
+    response = client.update_product("SKU/with space?x", {"price_with_vat": "121.00"})
+
+    assert response.status_code == 200
+    assert responses.calls[0].request.url.endswith("/products/SKU%2Fwith%20space%3Fx/")
 
 
 @responses.activate
@@ -107,8 +127,9 @@ def test_request_exception_exhausts_retries_and_raises():
         )
 
     client, _ = _client()
-    with pytest.raises(EshopError, match="network error"):
+    with pytest.raises(EshopError, match="network error") as exc_info:
         client.create_product({"sku": "SKU-5B"})
+    assert exc_info.value.retryable is True
     assert len(responses.calls) == client.max_retries + 1
 
 
@@ -117,8 +138,9 @@ def test_4xx_other_than_429_is_not_retried():
     responses.post("https://api.fake-eshop.cz/v1/products/", status=400, json={"err": "bad"})
 
     client, _ = _client()
-    with pytest.raises(EshopError, match="400"):
+    with pytest.raises(EshopError, match="400") as exc_info:
         client.create_product({"sku": "SKU-6"})
+    assert exc_info.value.retryable is False
     assert len(responses.calls) == 1  # no retry
 
 
@@ -127,8 +149,18 @@ def test_patch_404_raises_eshop_error():
     responses.patch("https://api.fake-eshop.cz/v1/products/SKU-404/", status=404, json={"err": "missing"})
 
     client, _ = _client()
-    with pytest.raises(EshopError, match="404"):
+    with pytest.raises(RemoteProductMissingError, match="404"):
         client.update_product("SKU-404", {"price_with_vat": "10.00"})
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_post_409_raises_conflict_error():
+    responses.post("https://api.fake-eshop.cz/v1/products/", status=409, json={"err": "exists"})
+
+    client, _ = _client()
+    with pytest.raises(RemoteProductConflictError, match="409"):
+        client.create_product({"sku": "SKU-409"})
     assert len(responses.calls) == 1
 
 
@@ -138,8 +170,9 @@ def test_max_retries_exceeded_raises():
         responses.post("https://api.fake-eshop.cz/v1/products/", status=429)
 
     client, _ = _client()
-    with pytest.raises(EshopError, match="exhausted retries"):
+    with pytest.raises(EshopError, match="exhausted retries") as exc_info:
         client.create_product({"sku": "SKU-7"})
+    assert exc_info.value.retryable is True
     assert len(responses.calls) == client.max_retries + 1
 
 

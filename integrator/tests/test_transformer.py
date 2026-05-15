@@ -45,6 +45,36 @@ def test_happy_path_applies_vat_and_sums_stocks():
     assert p.price_with_vat == Decimal("15004.61")
 
 
+def test_sku_is_stripped_before_validation_and_output():
+    raw = [{
+        "id": "  SKU-TRIM  ",
+        "title": "Trimmed",
+        "price_vat_excl": 100,
+        "stocks": {"praha": 1},
+        "attributes": {},
+    }]
+
+    products = transform(raw)
+
+    assert products[0].sku == "SKU-TRIM"
+
+
+def test_too_long_sku_is_logged_and_skipped(caplog):
+    sku = "S" * 65
+    raw = [{
+        "id": sku,
+        "title": "Too long",
+        "price_vat_excl": 100,
+        "stocks": {"praha": 1},
+        "attributes": {},
+    }]
+
+    products = _transform_with_log_capture(raw, caplog)
+
+    assert products == []
+    _assert_skip_logged(caplog, sku, "sku_too_long")
+
+
 def test_negative_price_is_logged_and_skipped(caplog):
     raw = [{
         "id": "SKU-002",
@@ -84,18 +114,35 @@ def test_null_price_is_logged_and_skipped(caplog):
     _assert_skip_logged(caplog, "SKU-004", "missing_price")
 
 
-def test_duplicate_sku_last_wins():
+def test_duplicate_sku_last_wins_and_logs_warning(caplog):
     raw = [
         {"id": "SKU-006", "title": "Tablets v1", "price_vat_excl": 250,
          "stocks": {"praha": 100}, "attributes": {}},
         {"id": "SKU-006", "title": "Tablets v2", "price_vat_excl": 300,
          "stocks": {"praha": 50}, "attributes": {}},
     ]
-    products = transform(raw)
+    products = _transform_with_log_capture(raw, caplog)
     assert len(products) == 1
     assert products[0].title == "Tablets v2"
     assert products[0].total_stock == 50
     assert products[0].price_with_vat == Decimal("363.00")
+    assert "Duplicate ERP record sku=SKU-006; keeping last record" in caplog.text
+
+
+def test_invalid_duplicate_does_not_replace_previous_valid_record(caplog):
+    raw = [
+        {"id": "SKU-007", "title": "Valid", "price_vat_excl": 250,
+         "stocks": {"praha": 100}, "attributes": {"color": "blue"}},
+        {"id": "SKU-007", "title": "Invalid later duplicate", "price_vat_excl": None,
+         "stocks": {"praha": 100}, "attributes": {"color": "red"}},
+    ]
+
+    products = _transform_with_log_capture(raw, caplog)
+
+    assert len(products) == 1
+    assert products[0].title == "Valid"
+    assert products[0].color == "blue"
+    _assert_skip_logged(caplog, "SKU-007", "missing_price")
 
 
 def test_partial_stock_with_na_uses_known_warehouses():
@@ -149,6 +196,21 @@ def test_invalid_stock_values_are_logged_and_skipped(stocks, caplog):
     _assert_skip_logged(caplog, "SKU-009", "invalid_stock_type")
 
 
+def test_negative_stock_is_logged_and_skipped(caplog):
+    raw = [{
+        "id": "SKU-NEG-STOCK",
+        "title": "Stock issue",
+        "price_vat_excl": 300,
+        "stocks": {"praha": -1},
+        "attributes": {"color": "white"},
+    }]
+
+    products = _transform_with_log_capture(raw, caplog)
+
+    assert products == []
+    _assert_skip_logged(caplog, "SKU-NEG-STOCK", "negative_stock")
+
+
 def test_missing_sku_is_logged_and_skipped(caplog):
     raw = [{"title": "Anonymous", "price_vat_excl": 100, "stocks": {"a": 1}}]
     products = _transform_with_log_capture(raw, caplog)
@@ -175,6 +237,32 @@ def test_invalid_price_types_are_logged_and_skipped(raw_price, expected_reason, 
     products = _transform_with_log_capture(raw, caplog)
     assert products == []
     _assert_skip_logged(caplog, "SKU-X", expected_reason)
+
+
+@pytest.mark.parametrize(
+    "raw_price",
+    [
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        float("nan"),
+        float("inf"),
+        Decimal("NaN"),
+    ],
+)
+def test_non_finite_prices_are_logged_and_skipped(raw_price, caplog):
+    raw = [{
+        "id": "SKU-NON-FINITE",
+        "title": "X",
+        "price_vat_excl": raw_price,
+        "stocks": {"praha": 1},
+        "attributes": {},
+    }]
+
+    products = _transform_with_log_capture(raw, caplog)
+
+    assert products == []
+    _assert_skip_logged(caplog, "SKU-NON-FINITE", "invalid_price_type")
 
 
 def test_full_erp_dataset_matches_expectations():

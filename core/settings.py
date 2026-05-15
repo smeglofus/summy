@@ -79,10 +79,11 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --- Cache ----------------------------------------------------------------
+REDIS_CACHE_URL = env.str("REDIS_CACHE_URL", "redis://redis:6379/2")
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": env.str("REDIS_CACHE_URL", "redis://redis:6379/2"),
+        "LOCATION": REDIS_CACHE_URL,
     }
 }
 
@@ -91,7 +92,11 @@ CELERY_BROKER_URL = env.str("CELERY_BROKER_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = env.str("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 ERP_SYNC_INTERVAL_SECONDS = env.float("ERP_SYNC_INTERVAL_SECONDS", 300.0)
+ERP_SYNC_TASK_RETRY_DELAY_SECONDS = env.int("ERP_SYNC_TASK_RETRY_DELAY_SECONDS", 60)
+ERP_SYNC_TASK_MAX_RETRIES = env.int("ERP_SYNC_TASK_MAX_RETRIES", 3)
 CELERY_BEAT_SCHEDULE = {
     "erp-to-eshop-sync": {
         "task": "integrator.tasks.sync_erp_to_eshop",
@@ -106,8 +111,11 @@ VAT_RATE = env.str("VAT_RATE", "0.21")
 ESHOP_API_BASE_URL = env.str("ESHOP_API_BASE_URL", "https://api.fake-eshop.cz/v1")
 ESHOP_API_KEY = env.str("ESHOP_API_KEY")
 ESHOP_RATE_LIMIT_PER_SEC = env.int("ESHOP_RATE_LIMIT_PER_SEC", 5)
+ESHOP_RATE_LIMIT_CACHE_KEY = env.str("ESHOP_RATE_LIMIT_CACHE_KEY", "eshop:rate-limit:products")
 ESHOP_MAX_RETRIES = env.int("ESHOP_MAX_RETRIES", 5)
 ESHOP_REQUEST_TIMEOUT = env.float("ESHOP_REQUEST_TIMEOUT", 10.0)
+ERP_SYNC_SKU_LOCK_TIMEOUT_SECONDS = env.float("ERP_SYNC_SKU_LOCK_TIMEOUT_SECONDS", 30.0)
+ERP_SYNC_SKU_LOCK_POLL_SECONDS = env.float("ERP_SYNC_SKU_LOCK_POLL_SECONDS", 0.1)
 
 # --- Logging --------------------------------------------------------------
 LOGGING = {

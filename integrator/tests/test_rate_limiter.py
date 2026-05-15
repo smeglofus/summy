@@ -1,6 +1,10 @@
 import threading
 
-from integrator.rate_limiter import RateLimiter
+import pytest
+from django.test import override_settings
+
+from integrator import rate_limiter as rate_limiter_module
+from integrator.rate_limiter import RateLimiter, _IN_PROCESS_WINDOWS
 
 
 class FakeClock:
@@ -16,12 +20,50 @@ class FakeClock:
         self.now += seconds
 
 
+class FailingRedis:
+    def eval(self, *args, **kwargs):
+        raise ConnectionError("redis down")
+
+
+@pytest.fixture(autouse=True)
+def clear_in_process_windows():
+    _IN_PROCESS_WINDOWS.clear()
+    yield
+    _IN_PROCESS_WINDOWS.clear()
+
+
 def test_first_n_acquires_do_not_sleep():
     clock = FakeClock()
     limiter = RateLimiter(rate=5, per=1.0, sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
     for _ in range(5):
         limiter.acquire()
     assert clock.sleeps == []
+
+
+def test_in_process_fallback_is_shared_by_cache_key():
+    clock = FakeClock()
+    limiter_a = RateLimiter(
+        rate=1,
+        per=1.0,
+        sleep_fn=clock.sleep,
+        monotonic_fn=clock.monotonic,
+        use_redis=False,
+        cache_key="test:shared",
+    )
+    limiter_b = RateLimiter(
+        rate=1,
+        per=1.0,
+        sleep_fn=clock.sleep,
+        monotonic_fn=clock.monotonic,
+        use_redis=False,
+        cache_key="test:shared",
+    )
+
+    limiter_a.acquire()
+    clock.now = 0.25
+    limiter_b.acquire()
+
+    assert clock.sleeps == [0.75]
 
 
 def test_sixth_acquire_sleeps_for_remaining_window():
@@ -76,3 +118,49 @@ def test_sleeping_acquire_does_not_hold_lock():
 
     assert acquired is True
     assert not thread.is_alive()
+
+
+def test_redis_failure_falls_back_to_in_process_limiter():
+    clock = FakeClock()
+    limiter = RateLimiter(
+        rate=1,
+        per=1.0,
+        sleep_fn=clock.sleep,
+        monotonic_fn=clock.monotonic,
+        redis_client=FailingRedis(),
+    )
+
+    limiter.acquire()
+    limiter.acquire()
+
+    assert limiter.using_redis is False
+    assert clock.sleeps == [1.0]
+
+
+@override_settings(CACHES={
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": "redis://redis.example:6379/2",
+    }
+})
+def test_default_redis_cache_location_is_used_when_available(monkeypatch):
+    redis_client = object()
+    calls = []
+
+    def fake_from_url(url):
+        calls.append(url)
+        return redis_client
+
+    monkeypatch.setattr(rate_limiter_module.Redis, "from_url", fake_from_url)
+
+    limiter = RateLimiter(rate=5, per=1.0)
+
+    assert limiter.using_redis is True
+    assert limiter._redis_client is redis_client
+    assert calls == ["redis://redis.example:6379/2"]
+
+
+def test_default_test_cache_uses_in_process_limiter():
+    limiter = RateLimiter(rate=5, per=1.0)
+
+    assert limiter.using_redis is False

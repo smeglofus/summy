@@ -1,14 +1,17 @@
 """ERP record validation and normalization."""
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable
 
 from django.conf import settings
 
+from .models import ProductSyncState
 from .schemas import NormalizedProduct
 
 DEFAULT_COLOR = "N/A"
+SKU_MAX_LENGTH = ProductSyncState._meta.get_field("sku").max_length
 _CENT = Decimal("0.01")
 
 logger = logging.getLogger(__name__)
@@ -22,27 +25,57 @@ class ValidationError(Exception):
         super().__init__(reason)
 
 
+@dataclass(frozen=True)
+class TransformResult:
+    products: list[NormalizedProduct]
+    invalid_count: int
+    duplicate_count: int
+
+
 def transform(records: Iterable[dict]) -> list[NormalizedProduct]:
     """Validate and normalize ERP records, skipping invalid records."""
-    deduped: "OrderedDict[str, dict]" = OrderedDict()
+    return transform_with_report(records).products
+
+
+def transform_with_report(records: Iterable[dict]) -> TransformResult:
+    """Validate records and keep the last valid record for duplicate SKUs."""
+    products_by_sku: "OrderedDict[str, NormalizedProduct]" = OrderedDict()
+    invalid_count = 0
+    duplicate_count = 0
 
     for record in records:
         if not isinstance(record, dict):
             _log_skip("?", "not_an_object")
+            invalid_count += 1
             continue
-        sku = record.get("id")
-        if not isinstance(sku, str) or not sku.strip():
+        raw_sku = record.get("id")
+        if not isinstance(raw_sku, str) or not raw_sku.strip():
             _log_skip("?", "missing_sku")
+            invalid_count += 1
             continue
-        deduped[sku] = record
+        sku = raw_sku.strip()
+        if len(sku) > SKU_MAX_LENGTH:
+            _log_skip(sku, "sku_too_long")
+            invalid_count += 1
+            continue
 
-    valid: list[NormalizedProduct] = []
-    for sku, record in deduped.items():
         try:
-            valid.append(_normalize(sku, record))
+            product = _normalize(sku, record)
         except ValidationError as exc:
             _log_skip(sku, exc.reason)
-    return valid
+            invalid_count += 1
+            continue
+
+        if sku in products_by_sku:
+            duplicate_count += 1
+            logger.warning("Duplicate ERP record sku=%s; keeping last record", sku)
+        products_by_sku[sku] = product
+
+    return TransformResult(
+        products=list(products_by_sku.values()),
+        invalid_count=invalid_count,
+        duplicate_count=duplicate_count,
+    )
 
 
 def _log_skip(sku: str, reason: str) -> None:
@@ -76,6 +109,8 @@ def _normalize_price(raw_price) -> Decimal:
         price = Decimal(str(raw_price))
     except (InvalidOperation, ValueError):
         raise ValidationError("invalid_price_type")
+    if not price.is_finite():
+        raise ValidationError("invalid_price_type")
     if price <= 0:
         raise ValidationError("non_positive_price")
 
@@ -92,6 +127,8 @@ def _normalize_stocks(raw_stocks) -> int:
         if isinstance(qty, bool):
             raise ValidationError("invalid_stock_type")
         if isinstance(qty, int):
+            if qty < 0:
+                raise ValidationError("negative_stock")
             total += qty
             has_integer = True
             continue

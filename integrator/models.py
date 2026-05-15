@@ -7,6 +7,8 @@ class ProductSyncState(models.Model):
     sku = models.CharField(max_length=64, primary_key=True)
     payload_hash = models.CharField(max_length=64, null=True, blank=True)
     remote_exists = models.BooleanField(default=False)
+    create_in_progress = models.BooleanField(default=False)
+    pending_payload_hash = models.CharField(max_length=64, null=True, blank=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
     last_remote_status = models.SmallIntegerField(null=True, blank=True)
 
