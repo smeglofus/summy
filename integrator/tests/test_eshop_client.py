@@ -149,3 +149,39 @@ def test_create_product_omits_idempotency_key_header_when_not_provided():
     client, _ = _client()
     client.create_product({"sku": "SKU-9"})
     assert "Idempotency-Key" not in responses.calls[0].request.headers
+
+
+@responses.activate
+def test_429_with_http_date_retry_after_is_parsed():
+    # RFC 7231 allows Retry-After as an HTTP-date.
+    from email.utils import format_datetime
+    from datetime import datetime, timedelta, timezone as dt_tz
+
+    retry_at = datetime.now(dt_tz.utc) + timedelta(seconds=7)
+    responses.post(
+        "https://api.fake-eshop.cz/v1/products/",
+        status=429,
+        headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+    )
+    responses.post("https://api.fake-eshop.cz/v1/products/", status=201, json={"ok": True})
+
+    client, sleeps = _client()
+    response = client.create_product({"sku": "SKU-10"})
+    assert response.status_code == 201
+    # Allow a small drift band since `now` is recomputed inside the client.
+    http_date_sleep = next((s for s in sleeps if 5.0 <= s <= 8.0), None)
+    assert http_date_sleep is not None, f"expected ~7s sleep from HTTP-date, got {sleeps}"
+
+
+@responses.activate
+def test_429_with_unparseable_retry_after_falls_back_to_backoff():
+    responses.post(
+        "https://api.fake-eshop.cz/v1/products/",
+        status=429,
+        headers={"Retry-After": "totally-not-a-date"},
+    )
+    responses.post("https://api.fake-eshop.cz/v1/products/", status=201, json={"ok": True})
+
+    client, sleeps = _client()
+    client.create_product({"sku": "SKU-11"})
+    assert 0.5 in sleeps  # 2**0 * 0.5

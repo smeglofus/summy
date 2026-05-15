@@ -97,6 +97,12 @@ def test_all_stocks_unknown_is_quarantined():
         {"praha": True},
         {"praha": 1, "brno": 2.5},
         {"praha": "5"},
+        # Whole-valued floats (3.0) are also quarantined — JSON has no integer
+        # type distinction, but the ERP contract requires integer quantities;
+        # silently coercing 3.0 -> 3 would hide a producer-side type bug.
+        {"praha": 3.0},
+        # Decimal isn't bool/int/float/str/None — falls into the catch-all reject.
+        {"praha": Decimal("3")},
     ],
 )
 def test_invalid_stock_values_are_quarantined(stocks):

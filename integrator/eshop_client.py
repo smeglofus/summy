@@ -7,8 +7,10 @@ Responsibilities:
 * Retry on transient 5xx with exponential backoff.
 * Raise EshopError on permanent failures.
 """
+import email.utils
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
 import requests
@@ -117,14 +119,24 @@ class EshopClient:
 
     @staticmethod
     def _parse_retry_after(response: requests.Response) -> float | None:
+        # RFC 7231 allows two forms: delta-seconds and HTTP-date.
         raw = response.headers.get("Retry-After")
         if not raw:
             return None
         try:
-            value = float(raw)
+            return max(float(raw), 0.0)
         except ValueError:
-            return None  # HTTP-date form not supported — fall back to backoff
-        return max(value, 0.0)
+            pass
+        try:
+            retry_at = email.utils.parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if retry_at is None:
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        now = datetime.now(retry_at.tzinfo)
+        return max((retry_at - now).total_seconds(), 0.0)
 
     @staticmethod
     def _backoff(attempt: int) -> float:
